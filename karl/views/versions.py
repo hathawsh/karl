@@ -1,5 +1,7 @@
 
 import datetime
+import logging
+import re
 import time
 
 from pyramid.httpexceptions import HTTPFound
@@ -17,7 +19,8 @@ from karl.utils import find_repo
 from karl.utils import find_profiles
 from karl.views.api import TemplateAPI
 from karl.views.utils import make_unique_name
-import json
+
+log = logging.getLogger(__name__)
 
 
 def show_history(context, request, tz=None):
@@ -83,40 +86,79 @@ def revert(context, request):
     return HTTPFound(location=resource_url(context, request))
 
 
-def traverse_trash(context, path):
-    """Yield (docid, deleted_item or None) for each element in a trash path.
+def decode_trash_path(s):
+    """Decode a string into a trash path (a list of (name, docid) pairs).
 
-    A trash path is a list of (name, docid) pairs. Unlike
-    normal paths, a trash path can descend into deleted containers and
-    deleted items.
+    Unlike normal paths, a trash path can descend into deleted containers
+    and deleted items. The docid of each path segment can be None, causing
+    the path to be ambiguous but still useful.
+    """
+    res = []
+    for part in s.split('/'):
+        mo = re.match(r'{([0-9\-]+)}(.+)', part)
+        if mo is not None:
+            # docid specified.
+            res.append((mo.group(2), int(mo.group(1))))
+        else:
+            # No docid specified.
+            res.append((part, None))
+    return res
+
+
+def encode_trash_path(path):
+    """Encode a trash path as a string."""
+    parts = []
+    for name, docid in path:
+        if docid is not None:
+            parts.append('{%d}%s' % (docid, name))
+        else:
+            parts.append(name)
+    return '/'.join(parts)
+
+
+def traverse_trash(context, path):
+    """Yield (name, docid, deleted_item or None) for elements in a trash path.
+
+    A trash path is a list of (name, docid) pairs. The docid of each path
+    segment can be None, causing the path to be ambiguous; this function
+    will react by choosing the first match it finds.
 
     Raises ValueError if an element of the path is not found or is not
-    valid.
+    valid. The ValueError may indicate a security violation attempt,
+    since invalid trash paths could be a way to expose sensitive info.
     """
     repo = find_repo(context)
     container_id = context.docid
     for name, docid in path:
-        docid = int(docid)
         try:
             contents = repo.container_contents(container_id)
         except NoResultFound:
             raise ValueError("Document %d is not a container." % container_id)
+
+        if docid is not None:
+            docid = int(docid)
+        else:
+            docid = contents.map.get(name)
+
         if contents.map.get(name) == docid:
             yield name, docid, None
             container_id = docid
             continue
 
         for item in contents.deleted:
-            if item.name == name and item.docid == docid:
-                yield name, docid, item
-                container_id = docid
+            if (item.name == name
+                    and (docid is None or item.docid == docid)
+                    and not item.new_container_ids):
+                yield name, item.docid, item
+                container_id = item.docid
                 break
         else:
-            raise ValueError("Subfolder %s (docid %d) not found in trash."
-                % (repr(name), docid))
+            raise ValueError("Subfolder not found in trash: %s (docid %s)"
+                % (name, docid))
 
 
 class ShowTrash(object):
+    """View that shows one folder of trash."""
 
     def __init__(self, context, request, tz=None):
         self.context = context
@@ -128,30 +170,29 @@ class ShowTrash(object):
         self.container_id = context.docid
         self.error = None
         self.deleted = []
+        self.subfolder_path = []
 
         subfolder = self.request.params.get('subfolder')
         if subfolder:
             try:
-                self.subfolder_path = list(json.loads(subfolder))
-                for _name, container_id, deleted_item in traverse_trash(
-                        self.context, self.subfolder_path):
+                path = decode_trash_path(subfolder)
+                for name, container_id, deleted_item in traverse_trash(
+                        self.context, path):
                     if deleted_item is not None:
                         self.deleted_branch = deleted_item
-                self.container_id = container_id
-            except ValueError, e:
+                    self.container_id = container_id
+                    self.subfolder_path.append((name, container_id))
+            except (ValueError, TypeError), e:
+                log.exception("Invalid trash subfolder: %s", subfolder)
                 self.error = e
-        else:
-            self.subfolder_path = []
-
-        if self.error is None:
-            self.fill_deleted()
 
     def __call__(self):
-        return {
-            'api': TemplateAPI(self.context, self.request, 'Trash'),
-            'deleted': self.deleted,
-            'error': self.error,
-        }
+        tapi = TemplateAPI(self.context, self.request, 'Trash')
+        if self.error is None:
+            self.fill_deleted()
+        else:
+            tapi.set_status_message(unicode(self.error))
+        return {'api': tapi, 'deleted': self.deleted}
 
     def fill_deleted(self):
         """Fill self.deleted."""
@@ -161,14 +202,15 @@ class ShowTrash(object):
             # Not a container.
             return
 
-        # Show items deleted from this container.
+        # Show items deleted (but not moved) from this container.
         contents_deleted = contents.deleted
         container_ids = set(self.repo.filter_container_ids(
             item.docid for item in contents_deleted))
         for item in contents_deleted:
+            if item.new_container_ids:
+                continue
             is_container = item.docid in container_ids
-            self.add_deleted_item(
-                item.name, item.docid, item, is_container)
+            self.add(item.name, item.docid, item, is_container)
 
         if self.deleted_branch is not None:
             # This container has been deleted, so show
@@ -177,8 +219,7 @@ class ShowTrash(object):
                 contents.map.values()))
             for name, docid in contents.map.items():
                 is_container = docid in container_ids
-                self.add_deleted_item(
-                    name, docid, self.deleted_branch, is_container)
+                self.add(name, docid, self.deleted_branch, is_container)
 
         else:
             # Show child containers that contain something deleted.
@@ -186,15 +227,14 @@ class ShowTrash(object):
                 self.repo.which_contain_deleted(contents.map.values()))
             for name, docid in contents.map.items():
                 if docid in which_contain_deleted:
-                    self.add_deleted_item(name, docid, None, True)
+                    self.add(name, docid, None, True)
 
         self.deleted.sort(key=lambda x: x['title'])
 
-    def add_deleted_item(self, name, docid, deleted_item, is_container):
+    def add(self, name, docid, deleted_item, is_container):
         """Add an item to self.deleted."""
         version = self.repo.history(docid, only_current=True)[0]
-        item_path = json.dumps(
-            self.subfolder_path + [(name, docid)], separators=(',', ':'))
+        item_path = encode_trash_path(self.subfolder_path + [(name, docid)])
 
         if is_container:
             url = resource_url(self.context, self.request, 'trash', query={
@@ -248,7 +288,6 @@ def _restore_subtree(repo, parent, request):
         for child_name, child_docid in contents.map.items():
             doc = _restore(repo, parent, child_docid, child_name)
             _restore_subtree(repo, doc, request)
-
         repo.archive_container(IContainerVersion(parent),
                                authenticated_userid(request))
     index_content(parent, None)
@@ -256,7 +295,7 @@ def _restore_subtree(repo, parent, request):
 
 def undelete(context, request):
     repo = find_repo(context)
-    path = list(json.loads(request.params['path']))
+    path = decode_trash_path(request.params['path'])
     parent = context
     for name, docid, _ in traverse_trash(context, path):
         try:
@@ -268,11 +307,8 @@ def undelete(context, request):
             doc = _restore(repo, parent, docid, name)
             repo.archive_container(IContainerVersion(parent),
                                    authenticated_userid(request))
-            index_content(doc, None)
-            parent = doc
-        else:
-            # This item already exists.
-            parent = parent[name]
+            index_content(parent, None)
+        parent = doc
 
     # If the user undeleted a container, restore everything it contained.
     _restore_subtree(repo, parent, request)
